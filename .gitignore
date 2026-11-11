@@ -23,3 +23,11 @@ __pycache__/
 *.log
 .env
 .env.*
+
+# Runtime data (uploads, saved projects, exports)
+backend/data/
+/data/
+
+# Go artifacts
+*.test
+*.out
