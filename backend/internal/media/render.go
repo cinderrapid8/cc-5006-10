@@ -32,25 +32,30 @@ type PiecePlan struct {
 	End   float64
 }
 
+// Equal reports whether two plans describe the same interval.
+func (p PiecePlan) Equal(o PiecePlan) bool {
+	return p.Start == o.Start && p.End == o.End
+}
+
 // BlockPlan is an ordered timeline block with its pieces and provenance.
 type BlockPlan struct {
-	BlockID      string
-	Refs         []domain.Ref
-	Pieces       []PiecePlan
-	ShortStart   bool
-	ShortEnd     bool
-	CrossedGap   bool
-	SegmentKeys  []string
+	BlockID     string
+	Refs        []domain.Ref
+	Pieces      []PiecePlan
+	ShortStart  bool
+	ShortEnd    bool
+	CrossedGap  bool
+	SegmentKeys []string
 }
 
 // RenderManifest records exactly what was produced, including the cut method
 // and any approximation, so outputs are self-describing.
 type RenderManifest struct {
-	OutputFile string       `json:"outputFile"`
-	CutMode    string       `json:"cutMode"`
-	CutNote    string       `json:"cutNote"`
+	OutputFile string        `json:"outputFile"`
+	CutMode    string        `json:"cutMode"`
+	CutNote    string        `json:"cutNote"`
 	Blocks     []BlockResult `json:"blocks"`
-	Cancelled  bool         `json:"cancelled"`
+	Cancelled  bool          `json:"cancelled"`
 }
 
 type BlockResult struct {
@@ -71,6 +76,14 @@ type ProgressFunc func(ratio float64, message string)
 // Render executes the full export: cut every piece, concat per block, then
 // concat all blocks. Cancellation via ctx kills the ffmpeg process group.
 func (r *Renderer) Render(ctx context.Context, src string, hasAudio bool, plans []BlockPlan, cutMode string, outPath string, prog ProgressFunc) (RenderManifest, error) {
+	return r.RenderWithTrace(ctx, src, hasAudio, plans, cutMode, outPath, prog, nil)
+}
+
+// RenderWithTrace is Render with an optional highlight-chain tracer. The
+// tracer only observes planned vs actual cut ranges and frame order; passing
+// nil yields byte-identical behavior to Render.
+func (r *Renderer) RenderWithTrace(ctx context.Context, src string, hasAudio bool, plans []BlockPlan, cutMode string, outPath string, prog ProgressFunc, tr *domain.Tracer) (RenderManifest, error) {
+	tr.Stage(domain.StageCut)
 	mf := RenderManifest{OutputFile: outPath, CutMode: cutMode}
 	switch cutMode {
 	case CutReencode:
@@ -119,7 +132,7 @@ func (r *Renderer) Render(ctx context.Context, src string, hasAudio bool, plans 
 				return mf, ctx.Err()
 			}
 			pf := filepath.Join(work, fmt.Sprintf("b%03d_p%03d.mp4", bi, pi))
-			actual, note, err := r.cutPiece(ctx, src, hasAudio, piece, cutMode, pf)
+			actual, note, err := r.cutPiece(ctx, src, hasAudio, piece, cutMode, pf, tr, bi, pi, plan)
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
 					mf.Cancelled = true
@@ -169,7 +182,7 @@ func (r *Renderer) Render(ctx context.Context, src string, hasAudio bool, plans 
 	return mf, nil
 }
 
-func (r *Renderer) cutPiece(ctx context.Context, src string, hasAudio bool, p PiecePlan, mode, out string) (PiecePlan, string, error) {
+func (r *Renderer) cutPiece(ctx context.Context, src string, hasAudio bool, p PiecePlan, mode, out string, tr *domain.Tracer, blockIdx, pieceIdx int, plan BlockPlan) (PiecePlan, string, error) {
 	switch mode {
 	case CutReencode:
 		args := []string{"-y", "-ss", f(p.Start), "-to", f(p.End), "-i", src,
@@ -179,13 +192,14 @@ func (r *Renderer) cutPiece(ctx context.Context, src string, hasAudio bool, p Pi
 		if err := r.run(ctx, args, out); err != nil {
 			return p, "", err
 		}
+		recordCutEvidence(tr, plan, blockIdx, pieceIdx, p, p, false)
 		return p, "", nil
 	default:
 		keyTimes, err := r.keyframeTimes(ctx, src)
 		if err != nil {
 			return p, "", err
 		}
-		actual := snapToKeyframes(p, keyTimes)
+		actual := SnapToKeyframes(p, keyTimes)
 		note := fmt.Sprintf("requested %.3f-%.3f; keyframe snap %.3f-%.3f", p.Start, p.End, actual.Start, actual.End)
 		args := []string{"-y", "-ss", f(actual.Start), "-to", f(actual.End), "-i", src,
 			"-c", "copy", "-avoid_negative_ts", "make_zero"}
@@ -193,8 +207,49 @@ func (r *Renderer) cutPiece(ctx context.Context, src string, hasAudio bool, p Pi
 		if err := r.run(ctx, args, out); err != nil {
 			return actual, note, err
 		}
+		recordCutEvidence(tr, plan, blockIdx, pieceIdx, p, actual, true)
 		return actual, note, nil
 	}
+}
+
+// recordCutEvidence captures planned vs actual ranges plus the concrete frame
+// indices, so a replay can show the actual frame order without re-probing.
+func recordCutEvidence(tr *domain.Tracer, plan BlockPlan, blockIdx, pieceIdx int, planned, actual PiecePlan, snapped bool) {
+	if tr == nil {
+		return
+	}
+	cfg := tr.Config()
+	cut := domain.CutTrace{
+		BlockID: plan.BlockID, SegmentKeys: append([]string(nil), plan.SegmentKeys...),
+		Order:        pieceIdx,
+		PlannedStart: planned.Start, PlannedEnd: planned.End,
+		ActualStart: actual.Start, ActualEnd: actual.End,
+		StartFrame:  domain.FrameIndexOf(actual.Start, cfg.FrameRate),
+		EndFrame:    domain.FrameIndexOf(actual.End, cfg.FrameRate),
+		Snapped:     snapped,
+		StartOnGrid: domain.OnFrameGrid(planned.Start, cfg.FrameRate),
+		EndOnGrid:   domain.OnFrameGrid(planned.End, cfg.FrameRate),
+	}
+	if snapped && len(cfg.KeyframeTimes) > 0 {
+		cut.NearestStartKf, cut.NearestEndKf = nearestKeyframes(planned, cfg.KeyframeTimes)
+	}
+	tr.RecordCut(cut)
+}
+
+func nearestKeyframes(p PiecePlan, keys []float64) (startKf, endKf float64) {
+	startKf, endKf = keys[0], 0
+	for _, k := range keys {
+		if k <= p.Start {
+			startKf = k
+		}
+		if k >= p.End && endKf == 0 {
+			endKf = k
+		}
+	}
+	if endKf == 0 {
+		endKf = keys[len(keys)-1]
+	}
+	return startKf, endKf
 }
 
 func appendAudioArgs(args []string, hasAudio bool) []string {
@@ -239,6 +294,11 @@ func (r *Renderer) run(ctx context.Context, args []string, out string) error {
 	return nil
 }
 
+// KeyframeTimes lists video keyframe PTS values via ffprobe.
+func (r *Renderer) KeyframeTimes(ctx context.Context, src string) ([]float64, error) {
+	return r.keyframeTimes(ctx, src)
+}
+
 func (r *Renderer) keyframeTimes(ctx context.Context, src string) ([]float64, error) {
 	cmd := exec.CommandContext(ctx, r.FFprobe,
 		"-v", "error", "-select_streams", "v:0",
@@ -260,9 +320,11 @@ func (r *Renderer) keyframeTimes(ctx context.Context, src string) ([]float64, er
 	return times, nil
 }
 
-// snapToKeyframes moves start to the latest keyframe <= requested start and
-// end to the earliest keyframe >= requested end (or end-of-file).
-func snapToKeyframes(p PiecePlan, keys []float64) PiecePlan {
+// SnapToKeyframes moves start to the latest keyframe <= requested start and
+// end to the earliest keyframe >= requested end. When no keyframe reaches the
+// requested end, the end clamps to the final keyframe (the last seekable
+// point), so the actual range never silently keeps an unseekable boundary.
+func SnapToKeyframes(p PiecePlan, keys []float64) PiecePlan {
 	if len(keys) == 0 {
 		return p
 	}
@@ -276,6 +338,7 @@ func snapToKeyframes(p PiecePlan, keys []float64) PiecePlan {
 		}
 	}
 	out.Start = best
+	out.End = keys[len(keys)-1]
 	for _, k := range keys {
 		if k >= p.End {
 			out.End = k
@@ -317,8 +380,11 @@ type Job struct {
 	Ratio    float64
 	Message  string
 	Manifest RenderManifest
-	Done     bool
-	Err      string
+	// TraceReport holds the highlight-chain evidence when an export ran with a
+	// tracer; nil otherwise. It is observational and never affects rendering.
+	TraceReport *domain.TraceReport
+	Done        bool
+	Err         string
 }
 
 // Set updates progress and is safe for concurrent use.

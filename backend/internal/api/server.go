@@ -14,6 +14,7 @@ import (
 	"highlight-assembly/internal/domain"
 	"highlight-assembly/internal/media"
 	"highlight-assembly/internal/store"
+	"highlight-assembly/internal/trace"
 )
 
 type Server struct {
@@ -37,6 +38,8 @@ func (s *Server) routes() {
 	s.Mux.HandleFunc("GET /api/projects/{id}", s.getProject)
 	s.Mux.HandleFunc("PUT /api/projects/{id}", s.updateProject)
 	s.Mux.HandleFunc("POST /api/projects/{id}/rebuild", s.rebuild)
+	s.Mux.HandleFunc("POST /api/projects/{id}/diagnose", s.diagnose)
+	s.Mux.HandleFunc("GET /api/diagnostics/{name}", s.getDiagnostic)
 	s.Mux.HandleFunc("POST /api/exports", s.startExport)
 	s.Mux.HandleFunc("GET /api/exports/{id}/status", s.exportStatus)
 	s.Mux.HandleFunc("POST /api/exports/{id}/cancel", s.exportCancel)
@@ -109,13 +112,21 @@ func (s *Server) serveVideo(w http.ResponseWriter, r *http.Request) {
 
 // createRequest is the full project payload from the UI or a test harness.
 type createRequest struct {
-	Name          string                 `json:"name"`
-	VideoPath     string                 `json:"videoPath"`
-	RawAnchors    []rawAnchor            `json:"anchors"`
-	RawEvents     []rawEvent             `json:"events"`
+	Name          string                    `json:"name"`
+	VideoPath     string                    `json:"videoPath"`
+	RawAnchors    []rawAnchor               `json:"anchors"`
+	RawEvents     []rawEvent                `json:"events"`
 	Paddings      map[string]domain.Padding `json:"paddings"`
-	OverlapPolicy string                 `json:"overlapPolicy"`
-	Gaps          []domain.Range         `json:"gaps"`
+	OverlapPolicy string                    `json:"overlapPolicy"`
+	Gaps          []domain.Range            `json:"gaps"`
+	// Diagnose is an off-by-default observation switch. When true the request
+	// additionally returns a trace report; it never changes segment selection.
+	Diagnose bool `json:"diagnose"`
+	// DiagnosticCutMode defaults to "reencode"; "keyframe" exercises cut-time
+	// snapping evidence without requiring an actual export.
+	DiagnosticCutMode string `json:"diagnosticCutMode"`
+	// FrameRate is optional; when zero the probed video rate is used.
+	FrameRate float64 `json:"frameRate"`
 }
 
 type rawAnchor struct {
@@ -126,11 +137,11 @@ type rawAnchor struct {
 }
 
 type rawEvent struct {
-	EventID   string `json:"eventId"`
-	Type      string `json:"type"`
-	Clock     string `json:"clock"`
-	Team      string `json:"team"`
-	Detail    string `json:"detail"`
+	EventID string `json:"eventId"`
+	Type    string `json:"type"`
+	Clock   string `json:"clock"`
+	Team    string `json:"team"`
+	Detail  string `json:"detail"`
 }
 
 func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
@@ -215,7 +226,57 @@ func (s *Server) createProject(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 201, p)
+	if !req.Diagnose {
+		writeJSON(w, 201, p)
+		return
+	}
+	// Diagnostic mode: re-run the same frozen inputs through the observable
+	// pipeline and return evidence alongside the unchanged project.
+	cutMode := req.DiagnosticCutMode
+	if cutMode == "" {
+		cutMode = media.CutReencode
+	}
+	frameRate := req.FrameRate
+	if frameRate == 0 {
+		frameRate = info.FrameRate
+	}
+	report, diagnosis := s.runDiagnosis(r, p, cutMode, frameRate)
+	writeJSON(w, 201, map[string]any{
+		"project":   p,
+		"trace":     report,
+		"diagnosis": diagnosis,
+	})
+}
+
+// runDiagnosis rebuilds evidence from a saved project. It never writes the
+// project back, so the diagnostic switch cannot alter stored selection.
+func (s *Server) runDiagnosis(r *http.Request, p *domain.Project, cutMode string, frameRate float64) (domain.TraceReport, trace.Diagnosis) {
+	var keyframes []float64
+	if cutMode == media.CutKeyframe {
+		if kf, err := s.Renderer.KeyframeTimes(r.Context(), p.VideoPath); err == nil {
+			keyframes = kf
+		}
+	}
+	snap := trace.SnapshotFromProject(p, cutMode, frameRate, keyframes)
+	tr, _ := trace.Replay(snap, trace.ReplayOptions{
+		CutMode: cutMode, FrameRate: frameRate, KeyframeTimes: keyframes,
+	})
+	tr.Finish()
+	return tr.Report(), trace.Diagnose(tr.Report())
+}
+
+func (s *Server) saveDiagnostic(prefix string, report domain.TraceReport, diagnosis trace.Diagnosis) (string, error) {
+	name := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	path := filepath.Join(s.Store.DiagnosticDir(), name+".json")
+	doc := map[string]any{"trace": report, "diagnosis": diagnosis}
+	data, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 func (s *Server) listProjects(w http.ResponseWriter, r *http.Request) {
@@ -237,10 +298,10 @@ func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
 }
 
 type updateRequest struct {
-	OverlapPolicy *string                  `json:"overlapPolicy"`
+	OverlapPolicy *string                   `json:"overlapPolicy"`
 	Paddings      map[string]domain.Padding `json:"paddings"`
-	BlockOrder    []string                 `json:"blockOrder"`
-	Included      map[string]bool          `json:"included"` // blockID -> included
+	BlockOrder    []string                  `json:"blockOrder"`
+	Included      map[string]bool           `json:"included"` // blockID -> included
 }
 
 func (s *Server) updateProject(w http.ResponseWriter, r *http.Request) {
@@ -306,6 +367,76 @@ func (s *Server) rebuild(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, p)
 }
 
+type diagnoseRequest struct {
+	CutMode       string    `json:"cutMode"`
+	FrameRate     float64   `json:"frameRate"`
+	KeyframeTimes []float64 `json:"keyframeTimes"`
+	// Save persists the snapshot/report under diagnostics and returns its name.
+	Save bool `json:"save"`
+}
+
+type diagnoseResponse struct {
+	Trace        domain.TraceReport `json:"trace"`
+	Diagnosis    trace.Diagnosis    `json:"diagnosis"`
+	DiagnosticID string             `json:"diagnosticId,omitempty"`
+}
+
+// diagnose replays a stored project's full chain and returns attributed
+// evidence. It is read-only against the project: rebuild/export selection is
+// untouched, and supplying keyframeTimes/frameRate makes it deterministic in
+// environments without ffprobe.
+func (s *Server) diagnose(w http.ResponseWriter, r *http.Request) {
+	p, err := s.Store.LoadProject(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, 404, "project not found: "+r.PathValue("id"))
+		return
+	}
+	req := diagnoseRequest{CutMode: media.CutReencode}
+	if r.ContentLength != 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, 400, "invalid JSON: "+err.Error())
+			return
+		}
+	}
+	if req.CutMode != media.CutReencode && req.CutMode != media.CutKeyframe {
+		writeErr(w, 400, "cutMode must be reencode or keyframe")
+		return
+	}
+	frameRate := req.FrameRate
+	var keyframes []float64
+	if req.KeyframeTimes != nil {
+		keyframes = req.KeyframeTimes
+	} else if req.CutMode == media.CutKeyframe {
+		kf, err := s.Renderer.KeyframeTimes(r.Context(), p.VideoPath)
+		if err != nil {
+			writeErr(w, 400, "cannot read keyframes: "+err.Error())
+			return
+		}
+		keyframes = kf
+	}
+	snap := trace.SnapshotFromProject(p, req.CutMode, frameRate, keyframes)
+	tr, _ := trace.Replay(snap, trace.ReplayOptions{
+		CutMode: req.CutMode, FrameRate: frameRate, KeyframeTimes: keyframes,
+	})
+	tr.Finish()
+	report, diagnosis := tr.Report(), trace.Diagnose(tr.Report())
+	resp := diagnoseResponse{Trace: report, Diagnosis: diagnosis}
+	if req.Save {
+		name, err := s.saveDiagnostic(p.ID, report, diagnosis)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		resp.DiagnosticID = name
+	}
+	writeJSON(w, 200, resp)
+}
+
+func (s *Server) getDiagnostic(w http.ResponseWriter, r *http.Request) {
+	name := filepath.Base(r.PathValue("name"))
+	http.ServeFile(w, r, filepath.Join(s.Store.DiagnosticDir(), name+".json"))
+}
+
 type exportRequest struct {
 	ProjectID string `json:"projectId"`
 	CutMode   string `json:"cutMode"`
@@ -360,10 +491,18 @@ func (s *Server) startExport(w http.ResponseWriter, r *http.Request) {
 	job.BindCancel(cancel)
 	s.Store.RegisterJob(jobID, job)
 
+	// Trace the real export so its evidence chain matches a later replay of the
+	// same project. Rendering inputs and outputs are not modified by the tracer.
+	tr := domain.NewTracer(domain.TraceConfig{FrameRate: info.FrameRate, CutMode: req.CutMode})
+	tr.Stage(domain.StageInput)
+
 	go func() {
-		mf, err := s.Renderer.Render(ctx, p.VideoPath, info.HasAudio, plans, req.CutMode, outPath, job.Set)
+		mf, err := s.Renderer.RenderWithTrace(ctx, p.VideoPath, info.HasAudio, plans, req.CutMode, outPath, job.Set, tr)
+		tr.Finish()
 		job.Lock()
 		job.Manifest = mf
+		report := tr.Report()
+		job.TraceReport = &report
 		job.Done = true
 		if err != nil {
 			if errors.Is(err, context.Canceled) {

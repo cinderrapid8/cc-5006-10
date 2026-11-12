@@ -17,7 +17,15 @@ const (
 // Merging is not de-duplication: two events with the same number are both
 // kept, and overlapping footage is represented once while still traceable
 // to all contributing events via Refs/SegmentKeys.
-func BuildBlocks(segments []*Segment, policy string) []*Block {
+//
+// The optional tracer records pairwise window relations (overlap vs boundary
+// touching) and the block each segment landed in; it never alters grouping.
+func BuildBlocks(segments []*Segment, policy string, tracer ...*Tracer) []*Block {
+	var tr *Tracer
+	if len(tracer) > 0 {
+		tr = tracer[0]
+	}
+	tr.Stage(StageMerge)
 	sorted := make([]*Segment, len(segments))
 	copy(sorted, segments)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -29,6 +37,7 @@ func BuildBlocks(segments []*Segment, policy string) []*Block {
 		for i, s := range sorted {
 			blocks = append(blocks, blockFromSegments(fmt.Sprintf("B%d", i), []*Segment{s}))
 		}
+		recordJoinEvidence(tr, sorted, blocks)
 		return blocks
 	}
 
@@ -56,7 +65,39 @@ func BuildBlocks(segments []*Segment, policy string) []*Block {
 		}
 	}
 	flush(len(blocks))
+	recordJoinEvidence(tr, sorted, blocks)
 	return blocks
+}
+
+// recordJoinEvidence logs only pairs that share footage or meet at a boundary:
+// disjoint pairs are uninteresting, which keeps diagnostic evidence bounded.
+func recordJoinEvidence(tr *Tracer, sorted []*Segment, blocks []*Block) {
+	if tr == nil {
+		return
+	}
+	blockOf := map[string]string{}
+	for _, b := range blocks {
+		for _, k := range b.Segments {
+			blockOf[k] = b.ID
+		}
+	}
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			a, b := sorted[i], sorted[j]
+			rel := ClassifyRelation(a.Wanted, b.Wanted)
+			if rel == RelationNone {
+				continue
+			}
+			blockA, blockB := blockOf[a.Key], blockOf[b.Key]
+			tr.RecordJoin(MergeJoin{
+				KeyA: a.Key, KeyB: b.Key, Relation: rel,
+				StartA: a.Wanted.Start, EndA: a.Wanted.End,
+				StartB: b.Wanted.Start, EndB: b.Wanted.End,
+				SameBlock: blockA == blockB, BlockID: blockA,
+				OverlapSec: OverlapLength(a.Wanted, b.Wanted),
+			})
+		}
+	}
 }
 
 func rangesOverlap(a, b Range) bool {

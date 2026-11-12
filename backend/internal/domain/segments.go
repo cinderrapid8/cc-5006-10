@@ -11,7 +11,17 @@ var DefaultPadding = Padding{BeforeSec: 5, AfterSec: 5}
 // BuildSegments maps every event and turns mapped ones into candidate
 // segments. Unmapped events are returned separately for a pending queue;
 // they are never cut by assuming equal numbers.
-func BuildSegments(events []Event, cm *ClockMap, meta VideoMeta, paddings map[string]Padding) ([]*Segment, []UnmappedEvent) {
+//
+// The optional tracer is observational only: it records per-event mapping and
+// per-segment window evidence without mutating any result. Passing nil (or no
+// tracer) preserves the original behavior exactly.
+func BuildSegments(events []Event, cm *ClockMap, meta VideoMeta, paddings map[string]Padding, tracer ...*Tracer) ([]*Segment, []UnmappedEvent) {
+	var tr *Tracer
+	if len(tracer) > 0 {
+		tr = tracer[0]
+	}
+	tr.Stage(StageMapping)
+	tr.Stage(StageSegments)
 	availLo, availHi := meta.AvailableStart, meta.AvailableEnd
 	if availHi <= 0 {
 		availHi = meta.DurationSec
@@ -19,12 +29,20 @@ func BuildSegments(events []Event, cm *ClockMap, meta VideoMeta, paddings map[st
 
 	var segs []*Segment
 	var unmapped []UnmappedEvent
-	for idx, ev := range events {
+	for _, ev := range events {
 		res := cm.Map(ev.Clock)
 		if !res.Mapped {
 			unmapped = append(unmapped, UnmappedEvent{Event: ev, Reason: res.Reason})
+			tr.RecordEvent(TraceEvent{
+				EventID: ev.EventID, Occurrence: ev.Occurrence,
+				ClockSec: ev.Clock, Mapped: false, Reason: res.Reason,
+			})
 			continue
 		}
+		tr.RecordEvent(TraceEvent{
+			EventID: ev.EventID, Occurrence: ev.Occurrence,
+			ClockSec: ev.Clock, Mapped: true, MappedVideo: res.VideoSec,
+		})
 		pad, ok := paddings[ev.Type]
 		if !ok {
 			pad = DefaultPadding
@@ -75,8 +93,14 @@ func BuildSegments(events []Event, cm *ClockMap, meta VideoMeta, paddings map[st
 		for _, p := range pieces {
 			seg.PlannedDuration += p.End - p.Start
 		}
+		tr.RecordWindow(SegmentWindow{
+			SegmentKey: seg.Key, EventID: ev.EventID, Occurrence: ev.Occurrence,
+			ClockSec: ev.Clock, MappedVideo: res.VideoSec,
+			WantedStart: want.Start, WantedEnd: want.End,
+			Pieces: pieces, Empty: seg.Empty,
+			ShortStart: seg.ShortStart, ShortEnd: seg.ShortEnd, CrossedGap: seg.CrossedGap,
+		})
 		segs = append(segs, seg)
-		_ = idx
 	}
 	return segs, unmapped
 }

@@ -30,6 +30,9 @@ func New(root string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Join(root, "exports"), 0o755); err != nil {
 		return nil, err
 	}
+	if err := os.MkdirAll(filepath.Join(root, "diagnostics"), 0o755); err != nil {
+		return nil, err
+	}
 	return &Store{root: root, jobs: map[string]*media.Job{}}, nil
 }
 
@@ -39,6 +42,10 @@ func (s *Store) ProjectPath(id string) string {
 
 func (s *Store) VideoDir() string  { return filepath.Join(s.root, "videos") }
 func (s *Store) ExportDir() string { return filepath.Join(s.root, "exports") }
+
+// DiagnosticDir holds replayable snapshots and reports. It is separate from
+// project documents so diagnostics can never mutate a saved selection.
+func (s *Store) DiagnosticDir() string { return filepath.Join(s.root, "diagnostics") }
 
 func (s *Store) SaveProject(p *domain.Project) error {
 	s.mu.Lock()
